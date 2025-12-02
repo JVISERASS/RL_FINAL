@@ -154,7 +154,10 @@ def extract_features(obs, just_pick=True):
 
 def compute_reward(obs, prev_obs, action, terminated, just_pick):
     """
-    Diseño de recompensa equilibrada.
+    Diseño de recompensa para guiar al agente.
+    
+    Entorno 1 (just_pick=True): Recoger un objeto
+    Entornos 2 y 3 (just_pick=False): Recoger y entregar
     """
     agent_x, agent_y = obs[0], obs[1]
     has_object = obs[8]
@@ -182,46 +185,52 @@ def compute_reward(obs, prev_obs, action, terminated, just_pick):
         prev_min_obj_dist = min_obj_dist
         prev_delivery_dist = delivery_dist
     
+    reward = -1.0  # Penalización por paso
+    
     # Penalización por colisión
     if collision > 0.5:
-        return -50.0
+        return -100.0
     
     if just_pick:
         # ENTORNO 1: Solo recoger
         if has_object > 0.5:
-            return 100.0  # Éxito
-        
-        # Pequeño reward shaping
-        reward = -0.1  # Penalización por paso
-        progress = prev_min_obj_dist - min_obj_dist
-        reward += progress * 2.0
-        return reward
-    
+            # Éxito: recogió objeto
+            return 100.0
+        else:
+            # Reward shaping: premiar acercarse al objeto
+            approach_reward = (prev_min_obj_dist - min_obj_dist) * 5.0
+            reward += approach_reward
     else:
         # ENTORNOS 2 y 3: Recoger y entregar
         if delivery > 0.5:
-            return 100.0  # Éxito
+            # Éxito: entregó objeto
+            return 200.0
         
-        # Penalizar soltar fuera del área
-        if has_object < 0.5 and prev_has_object > 0.5 and delivery < 0.5:
-            return -50.0
+        if terminated and has_object < 0.5 and prev_has_object > 0.5:
+            # Fracaso: soltó objeto fuera del área
+            return -100.0
         
-        reward = -0.1  # Penalización por paso
-        
-        # Bonus por recoger objeto
         if has_object > 0.5 and prev_has_object < 0.5:
-            reward += 20.0
+            # Acaba de coger objeto
+            reward += 30.0
         
         if has_object > 0.5:
-            # Con objeto: ir al área de entrega
-            progress = prev_delivery_dist - delivery_dist
-            reward += progress * 3.0
+            # Tiene objeto: premiar acercarse al área de entrega
+            approach_reward = (prev_delivery_dist - delivery_dist) * 5.0
+            reward += approach_reward
         else:
-            # Sin objeto: ir al objeto más cercano
-            progress = prev_min_obj_dist - min_obj_dist
-            reward += progress * 2.0
-        
-        return reward
+            # No tiene objeto: premiar acercarse al objeto más cercano
+            approach_reward = (prev_min_obj_dist - min_obj_dist) * 5.0
+            reward += approach_reward
+    
+    return reward
+
+
+def is_success(obs, just_pick):
+    """Determina si se ha alcanzado el objetivo según el entorno."""
+    if just_pick:
+        return obs[8] > 0.5  # agent_has_object
+    return obs[10] > 0.5     # delivery
 
 
 # ============================================================================
@@ -234,7 +243,7 @@ class DQNAgent:
     def __init__(
         self,
         state_dim=12,
-        action_dim=6,
+        action_dim=6,  # Número máximo de acciones (se recorta según entorno)
         hidden_dim=128,
         lr=1e-3,
         gamma=0.99,
@@ -256,6 +265,8 @@ class DQNAgent:
         self.epsilon_decay = epsilon_decay
         self.batch_size = batch_size
         self.target_update = target_update
+        self.max_actions = action_dim
+        self.action_dim = action_dim
         
         # Redes
         self.policy_net = DQN(state_dim, action_dim, hidden_dim).to(self.device)
@@ -274,6 +285,12 @@ class DQNAgent:
         
         # Métricas
         self.losses = []
+
+    def set_action_dim(self, action_dim):
+        """Activa únicamente las acciones disponibles en el entorno actual."""
+        if action_dim < 1 or action_dim > self.max_actions:
+            raise ValueError(f"action_dim debe estar en [1, {self.max_actions}]")
+        self.action_dim = action_dim
     
     def select_action(self, state, training=True):
         """Selecciona acción usando política epsilon-greedy."""
@@ -282,7 +299,7 @@ class DQNAgent:
         
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            q_values = self.policy_net(state_tensor)
+            q_values = self.policy_net(state_tensor)[:, :self.action_dim]
             return q_values.argmax(dim=1).item()
     
     def store_transition(self, state, action, reward, next_state, done):
@@ -290,7 +307,7 @@ class DQNAgent:
         self.buffer.push(state, action, reward, next_state, done)
     
     def update(self):
-        """Actualiza la red con un mini-batch del buffer (Double DQN)."""
+        """Actualiza la red con un mini-batch del buffer."""
         if len(self.buffer) < self.batch_size:
             return
         
@@ -304,12 +321,12 @@ class DQNAgent:
         dones = torch.FloatTensor(dones).to(self.device)
         
         # Q(s, a) actual
-        q_values = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        q_values = self.policy_net(states)[:, :self.action_dim]
+        q_values = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
         
-        # Double DQN: seleccionar acción con policy_net, evaluar con target_net
+        # Q(s', a') máximo según target network
         with torch.no_grad():
-            next_actions = self.policy_net(next_states).argmax(1)
-            next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            next_q_values = self.target_net(next_states)[:, :self.action_dim].max(1)[0]
             target_q_values = rewards + self.gamma * next_q_values * (1 - dones)
         
         # Loss
@@ -340,7 +357,8 @@ class DQNAgent:
             'target_net': self.target_net.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'epsilon': self.epsilon,
-            'steps': self.steps
+            'steps': self.steps,
+            'action_dim': self.action_dim
         }, path)
         print(f"Modelo guardado en: {path}")
     
@@ -352,6 +370,7 @@ class DQNAgent:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.epsilon = checkpoint['epsilon']
         self.steps = checkpoint['steps']
+        self.set_action_dim(checkpoint.get('action_dim', self.action_dim))
         print(f"Modelo cargado desde: {path}")
 
 
@@ -377,33 +396,23 @@ def train(agent, entorno_num, n_episodes=1000, max_steps=500, save_dir="modelos_
     else:  # Entorno 3
         just_pick = False
         random_objects = True
-    
-    # Ajustar número de acciones según entorno
-    if just_pick:
-        agent.action_dim = 5  # Sin acción de soltar
-    else:
-        agent.action_dim = 6  # Con acción de soltar
-    
+
+    env = WarehouseEnv(just_pick=just_pick, random_objects=random_objects)
+    agent.set_action_dim(env.action_space.n)
+
     print(f"Configuración: just_pick={just_pick}, random_objects={random_objects}")
     print(f"Acciones disponibles: {agent.action_dim}")
-    
-    env = WarehouseEnv(just_pick=just_pick, random_objects=random_objects)
     
     # Métricas
     episode_rewards = []
     episode_lengths = []
     successes = []
     
-    # Umbral de éxito dinámico según entorno
-    success_threshold = 80 if just_pick else 150
-    
     for episode in range(n_episodes):
         obs, _ = env.reset()
         state = extract_features(obs, just_pick)
-        prev_obs = None
         
         episode_reward = 0
-        episode_success = False
         
         for step in range(max_steps):
             # Seleccionar acción
@@ -418,12 +427,6 @@ def train(agent, entorno_num, n_episodes=1000, max_steps=500, save_dir="modelos_
             
             done = terminated or truncated
             
-            # Detectar éxito real
-            if just_pick and next_obs[8] > 0.5:
-                episode_success = True
-            elif not just_pick and next_obs[10] > 0.5:
-                episode_success = True
-            
             # Almacenar transición
             agent.store_transition(state, action, reward, next_state, float(done))
             
@@ -431,7 +434,6 @@ def train(agent, entorno_num, n_episodes=1000, max_steps=500, save_dir="modelos_
             agent.update()
             
             episode_reward += reward
-            prev_obs = obs
             obs = next_obs
             state = next_state
             
@@ -445,8 +447,9 @@ def train(agent, entorno_num, n_episodes=1000, max_steps=500, save_dir="modelos_
         episode_rewards.append(episode_reward)
         episode_lengths.append(step + 1)
         
-        # Determinar éxito real basado en flags
-        successes.append(episode_success)
+        # Determinar éxito
+        success = is_success(obs, just_pick)
+        successes.append(success)
         
         # Imprimir progreso
         if (episode + 1) % 100 == 0:
@@ -534,7 +537,7 @@ def plot_training(metrics, entorno_num, save_dir):
 # ============================================================================
 
 def evaluate(agent, entorno_num, n_episodes=100):
-    """Evalúa el agente entrenado usando flags del entorno."""
+    """Evalúa el agente entrenado."""
     print(f"\n{'='*40}")
     print(f"EVALUACIÓN - ENTORNO {entorno_num}")
     print(f"{'='*40}")
@@ -548,13 +551,9 @@ def evaluate(agent, entorno_num, n_episodes=100):
     else:
         just_pick = False
         random_objects = True
-    
-    if just_pick:
-        agent.action_dim = 5
-    else:
-        agent.action_dim = 6
-    
+
     env = WarehouseEnv(just_pick=just_pick, random_objects=random_objects)
+    agent.set_action_dim(env.action_space.n)
     
     successes = 0
     collisions = 0
@@ -567,8 +566,6 @@ def evaluate(agent, entorno_num, n_episodes=100):
         
         episode_reward = 0
         steps = 0
-        episode_success = False
-        episode_collision = False
         
         for step in range(500):
             action = agent.select_action(state, training=False)
@@ -577,15 +574,6 @@ def evaluate(agent, entorno_num, n_episodes=100):
             reward = compute_reward(next_obs, obs, action, terminated, just_pick)
             episode_reward += reward
             steps += 1
-            
-            # Detectar éxito real basado en flags del entorno
-            if just_pick and next_obs[8] > 0.5:  # has_object = recogió
-                episode_success = True
-            elif not just_pick and next_obs[10] > 0.5:  # delivery = entregó
-                episode_success = True
-            
-            if next_obs[9] > 0.5:  # Colisión
-                episode_collision = True
             
             obs = next_obs
             state = extract_features(obs, just_pick)
@@ -596,9 +584,9 @@ def evaluate(agent, entorno_num, n_episodes=100):
         total_rewards.append(episode_reward)
         total_steps.append(steps)
         
-        if episode_success:
+        if is_success(obs, just_pick):
             successes += 1
-        if episode_collision:
+        if obs[9] > 0.5:  # Colisión
             collisions += 1
     
     env.close()
@@ -650,7 +638,7 @@ if __name__ == "__main__":
         gamma=0.99,
         epsilon_start=1.0,
         epsilon_end=0.01,
-        epsilon_decay=0.9995,
+        epsilon_decay=0.997,
         buffer_size=50000,
         batch_size=64,
         target_update=100
