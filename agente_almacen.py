@@ -227,7 +227,10 @@ def compute_reward(obs, prev_obs, action, terminated, just_pick):
 
 
 def is_success(obs, just_pick):
-    """Determina si se ha alcanzado el objetivo según el entorno."""
+    """Determina si se ha alcanzado el objetivo según el entorno (sin colisión)."""
+    collision = obs[9] > 0.5
+    if collision:
+        return False
     if just_pick:
         return obs[8] > 0.5  # agent_has_object
     return obs[10] > 0.5     # delivery
@@ -364,7 +367,7 @@ class DQNAgent:
     
     def load(self, path):
         """Carga el modelo."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.policy_net.load_state_dict(checkpoint['policy_net'])
         self.target_net.load_state_dict(checkpoint['target_net'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
